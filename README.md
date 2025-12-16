@@ -30,6 +30,39 @@
 
 ---
 
+## 🔬 للمطورين الذين يعشقون التفاصيل
+
+**عارض تفاصيل IPA** - أداة تقنية متقدمة للمطورين المحترفين 🚀
+
+### 📂 الصيغ المدعومة
+- 📱 **`.ipa`** → تطبيقات iOS كاملة
+- 🔐 **`.mobileprovision`** → ملفات التوقيع
+- 📋 **`.provisionprofile`** → بروفايلات التوقيع
+- 📦 **`.app`** → حزم التطبيقات مباشرة
+
+### 🎯 ما تحصل عليه
+- ✨ معلومات التطبيق الكاملة (Bundle ID, Version, SDK)
+- 🔒 شهادات الأمان + SHA-1 Fingerprints
+- 📋 Entitlements منسقة بشكل احترافي
+- 📚 قائمة Frameworks & Bundles المضمنة
+- 🆔 Device UDIDs للملفات المصرح بها
+- 👥 تفاصيل Team & Provisioning
+
+### ⚡ الأداء المتقدم
+- ✅ استخراج ذكي (Info.plist + embedded.mobileprovision فقط)
+- ✅ معاينة في **ثانيتين** بدل 15 ثانية
+- ✅ بدون QuickLook dependencies
+- ✅ بدون SIP disabled
+- ✅ يعمل native على Apple Silicon
+
+### 🛠 التقنيات المستخدمة
+- **Bash + AppleScript** للتكامل مع macOS
+- **macOS Native Tools** (security, openssl, PlistBuddy)
+- **HTML5 + CSS3** للواجهة الحديثة
+- **CMS Decoding** للشهادات والتوقيعات
+
+---
+
 ## المميزات
 
 - 📱 **تحليل ملفات IPA** - عرض تفاصيل شاملة حول تطبيقات iOS
