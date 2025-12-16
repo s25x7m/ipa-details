@@ -1,0 +1,601 @@
+#!/bin/bash
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <path-to-file>"
+    echo "Example: $0 MyApp.ipa"
+    echo "Supports: .ipa, .mobileprovision, .provisionprofile, .app"
+    exit 1
+fi
+
+INPUT_FILE="$1"
+
+if [ ! -e "$INPUT_FILE" ]; then
+    echo "Error: File not found: $INPUT_FILE"
+    exit 1
+fi
+
+# Detect file type
+FILE_EXT="${INPUT_FILE##*.}"
+FILE_TYPE="unknown"
+
+if [ -d "$INPUT_FILE" ] && [[ "$INPUT_FILE" == *.app ]]; then
+    FILE_TYPE="app"
+elif [[ "$FILE_EXT" == "ipa" ]]; then
+    FILE_TYPE="ipa"
+elif [[ "$FILE_EXT" == "mobileprovision" ]] || [[ "$FILE_EXT" == "provisionprofile" ]]; then
+    FILE_TYPE="provision"
+fi
+
+if [ "$FILE_TYPE" == "unknown" ]; then
+    echo "Error: Unsupported file type"
+    exit 1
+fi
+
+echo "Processing $FILE_TYPE file..."
+
+# Create temp directory
+TEMP_DIR=$(mktemp -d)
+OUTPUT_HTML="$TEMP_DIR/preview.html"
+PROFILE_PLIST="$TEMP_DIR/profile.plist"
+ENTITLEMENTS_PLIST="$TEMP_DIR/entitlements.plist"
+
+# Handle different file types
+if [ "$FILE_TYPE" == "provision" ]; then
+    # Process standalone provisioning profile
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    source "$SCRIPT_DIR/provision-preview.sh"
+    exit 0
+elif [ "$FILE_TYPE" == "app" ]; then
+    # Process .app bundle
+    APP_DIR="$INPUT_FILE"
+    IPA_FILE=""
+    # For .app bundles, we'll set these later based on whether it's from IPA or standalone
+    APP_NAME_IN_ZIP=""
+else
+    # Process IPA file
+    IPA_FILE="$INPUT_FILE"
+    # Only extract what we need (much faster than extracting everything)
+    # First, find the .app directory name without extracting
+    APP_NAME_IN_ZIP=$(unzip -l "$IPA_FILE" | grep "Payload/.*\.app/" | head -1 | awk '{print $NF}' | sed 's/Payload\///' | sed 's/\/.*//')
+
+    if [ -z "$APP_NAME_IN_ZIP" ]; then
+        echo "Error: No .app found in IPA"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+
+    # Extract only Info.plist and provisioning profile (very fast)
+    unzip -q "$IPA_FILE" "Payload/$APP_NAME_IN_ZIP/Info.plist" -d "$TEMP_DIR" 2>/dev/null
+    unzip -q "$IPA_FILE" "Payload/$APP_NAME_IN_ZIP/embedded.mobileprovision" -d "$TEMP_DIR" 2>/dev/null
+
+    # Extract one icon file (much faster than searching after full extraction)
+    unzip -q "$IPA_FILE" "Payload/$APP_NAME_IN_ZIP/AppIcon60x60@2x.png" -d "$TEMP_DIR" 2>/dev/null || \
+    unzip -q "$IPA_FILE" "Payload/$APP_NAME_IN_ZIP/Icon-60@2x.png" -d "$TEMP_DIR" 2>/dev/null || \
+    unzip -q "$IPA_FILE" "Payload/$APP_NAME_IN_ZIP/Icon@2x.png" -d "$TEMP_DIR" 2>/dev/null
+
+    APP_DIR="$TEMP_DIR/Payload/$APP_NAME_IN_ZIP"
+fi
+
+# Read Info.plist (works for both .ipa and .app)
+INFO_PLIST="$APP_DIR/Info.plist"
+APP_NAME=$(defaults read "$INFO_PLIST" CFBundleDisplayName 2>/dev/null || defaults read "$INFO_PLIST" CFBundleName 2>/dev/null || echo "Unknown")
+BUNDLE_ID=$(defaults read "$INFO_PLIST" CFBundleIdentifier 2>/dev/null || echo "Unknown")
+VERSION=$(defaults read "$INFO_PLIST" CFBundleShortVersionString 2>/dev/null || echo "Unknown")
+BUILD=$(defaults read "$INFO_PLIST" CFBundleVersion 2>/dev/null || echo "Unknown")
+MIN_OS=$(defaults read "$INFO_PLIST" MinimumOSVersion 2>/dev/null || echo "Unknown")
+SDK_VERSION=$(defaults read "$INFO_PLIST" DTSDKName 2>/dev/null || echo "")
+
+# Extract Frameworks/Concepts (check for embedded frameworks)
+FRAMEWORKS_LIST=""
+FRAMEWORKS_COUNT=0
+if [ -n "$IPA_FILE" ]; then
+    # From IPA file
+    if unzip -l "$IPA_FILE" | grep -q "Payload/$APP_NAME_IN_ZIP/Frameworks/"; then
+        FRAMEWORKS_LIST=$(unzip -l "$IPA_FILE" | grep "Payload/$APP_NAME_IN_ZIP/Frameworks/.*\.framework/" | awk '{print $NF}' | sed "s|Payload/$APP_NAME_IN_ZIP/Frameworks/||" | sed 's|/.*||' | sort -u)
+        FRAMEWORKS_COUNT=$(echo "$FRAMEWORKS_LIST" | grep -v '^$' | wc -l | tr -d ' ')
+    fi
+else
+    # From .app bundle
+    if [ -d "$APP_DIR/Frameworks" ]; then
+        FRAMEWORKS_LIST=$(ls -1 "$APP_DIR/Frameworks" | grep "\.framework$" | sed 's/\.framework$//')
+        FRAMEWORKS_COUNT=$(echo "$FRAMEWORKS_LIST" | grep -v '^$' | wc -l | tr -d ' ')
+    fi
+fi
+
+# Extract Bundle/Plugin folders
+BUNDLES_LIST=""
+BUNDLES_COUNT=0
+if [ -n "$IPA_FILE" ]; then
+    # From IPA file
+    if unzip -l "$IPA_FILE" | grep -qE "Payload/$APP_NAME_IN_ZIP/(PlugIns|.*\.(appex|bundle))"; then
+        BUNDLES_LIST=$(unzip -l "$IPA_FILE" | grep -E "Payload/$APP_NAME_IN_ZIP/(PlugIns/.*\.(appex|bundle)|.*\.bundle)/" | awk '{print $NF}' | sed "s|Payload/$APP_NAME_IN_ZIP/||" | sed 's|/.*||' | sort -u)
+        BUNDLES_COUNT=$(echo "$BUNDLES_LIST" | grep -v '^$' | wc -l | tr -d ' ')
+    fi
+else
+    # From .app bundle
+    BUNDLES_LIST=$(find "$APP_DIR" -maxdepth 2 \( -name "*.appex" -o -name "*.bundle" \) -type d 2>/dev/null | sed "s|$APP_DIR/||" | sed 's|/.*||' | sort -u)
+    BUNDLES_COUNT=$(echo "$BUNDLES_LIST" | grep -v '^$' | wc -l | tr -d ' ')
+fi
+
+# Device family
+DEVICE_FAMILY_RAW=$(defaults read "$INFO_PLIST" UIDeviceFamily 2>/dev/null || echo "")
+DEVICE_FAMILY=""
+if [[ "$DEVICE_FAMILY_RAW" == *"1"* ]]; then
+    DEVICE_FAMILY="iPhone"
+fi
+if [[ "$DEVICE_FAMILY_RAW" == *"2"* ]]; then
+    if [ -n "$DEVICE_FAMILY" ]; then
+        DEVICE_FAMILY="$DEVICE_FAMILY, iPad"
+    else
+        DEVICE_FAMILY="iPad"
+    fi
+fi
+[ -z "$DEVICE_FAMILY" ] && DEVICE_FAMILY="Unknown"
+
+# Get file size
+FILE_SIZE=$(ls -lh "$IPA_FILE" | awk '{print $5}')
+
+# Try to find app icon
+ICON_FILE=$(find "$APP_DIR" -name "AppIcon60x60@2x.png" -o -name "Icon-60@2x.png" -o -name "Icon@2x.png" 2>/dev/null | head -1)
+ICON_DATA=""
+if [ -n "$ICON_FILE" ] && [ -f "$ICON_FILE" ]; then
+    ICON_DATA="data:image/png;base64,$(base64 -i "$ICON_FILE" 2>/dev/null)"
+fi
+
+# Read provisioning profile if exists
+PROVISION_FILE="$APP_DIR/embedded.mobileprovision"
+PROFILE_NAME=""
+TEAM_NAME=""
+TEAM_ID=""
+APP_ID_NAME=""
+PROFILE_UUID=""
+EXPIRY=""
+CREATION=""
+PROFILE_TYPE=""
+PLATFORM=""
+DEVICES_HTML=""
+CERTS_HTML=""
+ENTITLEMENTS_HTML=""
+
+if [ -f "$PROVISION_FILE" ]; then
+    # Extract plist from CMS
+    security cms -D -i "$PROVISION_FILE" -o "$PROFILE_PLIST" 2>/dev/null
+    
+    if [ -f "$PROFILE_PLIST" ]; then
+        PROFILE_NAME=$(defaults read "$PROFILE_PLIST" Name 2>/dev/null || echo "Unknown")
+        TEAM_NAME=$(defaults read "$PROFILE_PLIST" TeamName 2>/dev/null || echo "Unknown")
+        TEAM_ID=$(defaults read "$PROFILE_PLIST" TeamIdentifier 2>/dev/null | sed 's/[()]//g' | awk '{print $1}' || echo "Unknown")
+        APP_ID_NAME=$(defaults read "$PROFILE_PLIST" AppIDName 2>/dev/null || echo "Unknown")
+        PROFILE_UUID=$(defaults read "$PROFILE_PLIST" UUID 2>/dev/null || echo "Unknown")
+        EXPIRY=$(defaults read "$PROFILE_PLIST" ExpirationDate 2>/dev/null || echo "Unknown")
+        CREATION=$(defaults read "$PROFILE_PLIST" CreationDate 2>/dev/null || echo "Unknown")
+        PLATFORM=$(defaults read "$PROFILE_PLIST" Platform 2>/dev/null | sed 's/[()]//g' | tr '\n' ',' | sed 's/,$//' || echo "iOS")
+        
+        # Determine profile type
+        HAS_DEVICES=$(defaults read "$PROFILE_PLIST" ProvisionedDevices 2>/dev/null)
+        GET_TASK_ALLOW=$(defaults read "$PROFILE_PLIST" Entitlements:get-task-allow 2>/dev/null || echo "0")
+        PROVISIONS_ALL=$(defaults read "$PROFILE_PLIST" ProvisionsAllDevices 2>/dev/null || echo "0")
+        
+        if [ "$PROVISIONS_ALL" == "1" ]; then
+            PROFILE_TYPE="Enterprise"
+        elif [ -n "$HAS_DEVICES" ]; then
+            if [ "$GET_TASK_ALLOW" == "1" ]; then
+                PROFILE_TYPE="Development"
+            else
+                PROFILE_TYPE="Distribution (Ad Hoc)"
+            fi
+        else
+            PROFILE_TYPE="Distribution (App Store)"
+        fi
+        
+        # Extract devices
+        DEVICES=$(defaults read "$PROFILE_PLIST" ProvisionedDevices 2>/dev/null | grep -v "(" | grep -v ")" | sed 's/^[[:space:]]*//' | sed '/^$/d' | sort)
+        if [ -n "$DEVICES" ]; then
+            DEVICE_COUNT=$(echo "$DEVICES" | wc -l | tr -d ' ')
+            DEVICES_HTML="<div class='section'><h2>Devices ($DEVICE_COUNT)</h2><div class='device-list'>"
+            while IFS= read -r device; do
+                device=$(echo "$device" | sed 's/[,;]$//')
+                DEVICES_HTML="$DEVICES_HTML<div class='device-row'>$device</div>"
+            done <<< "$DEVICES"
+            DEVICES_HTML="$DEVICES_HTML</div></div>"
+        fi
+        
+        # Extract certificates (optimized)
+        CERT_COUNT=$(/usr/libexec/PlistBuddy -c "Print DeveloperCertificates" "$PROFILE_PLIST" 2>/dev/null | grep -c "Data")
+        if [ "$CERT_COUNT" -gt 0 ] 2>/dev/null; then
+            CERTS_HTML="<div class='section'><h2>Certificates ($CERT_COUNT)</h2><div class='certs-list'>"
+            for ((i=0; i<CERT_COUNT; i++)); do
+                CERT_INFO=$(/usr/libexec/PlistBuddy -c "Print DeveloperCertificates:$i" "$PROFILE_PLIST" 2>/dev/null | openssl x509 -inform DER -noout -subject -dates -serial -fingerprint 2>/dev/null)
+                if [ -n "$CERT_INFO" ]; then
+                    CERT_SUBJECT=$(echo "$CERT_INFO" | grep "subject" | sed 's/subject=//' | sed 's/.*CN = //' | sed 's/,.*//')
+                    CERT_EXPIRY=$(echo "$CERT_INFO" | grep "notAfter" | sed 's/notAfter=//')
+                    CERT_CREATED=$(echo "$CERT_INFO" | grep "notBefore" | sed 's/notBefore=//')
+                    CERT_SERIAL=$(echo "$CERT_INFO" | grep "serial" | sed 's/serial=//')
+                    CERT_SHA1=$(echo "$CERT_INFO" | grep "SHA1 Fingerprint" | sed 's/SHA1 Fingerprint=//')
+                    
+                    CERTS_HTML="$CERTS_HTML<div class='cert-detail'>"
+                    CERTS_HTML="$CERTS_HTML<div class='cert-row'><div class='cert-label'>Name:</div><div class='cert-value'>$CERT_SUBJECT</div></div>"
+                    CERTS_HTML="$CERTS_HTML<div class='cert-row'><div class='cert-label'>Creation Date:</div><div class='cert-value'>$CERT_CREATED</div></div>"
+                    CERTS_HTML="$CERTS_HTML<div class='cert-row'><div class='cert-label'>Expiration:</div><div class='cert-value'>$CERT_EXPIRY</div></div>"
+                    CERTS_HTML="$CERTS_HTML<div class='cert-row'><div class='cert-label'>Serial Number:</div><div class='cert-value'>$CERT_SERIAL</div></div>"
+                    CERTS_HTML="$CERTS_HTML<div class='cert-row'><div class='cert-label'>SHA-1:</div><div class='cert-value cert-hash'>$CERT_SHA1</div></div>"
+                    CERTS_HTML="$CERTS_HTML</div>"
+                    
+                    if [ $i -lt $((CERT_COUNT - 1)) ]; then
+                        CERTS_HTML="$CERTS_HTML<div class='cert-separator'></div>"
+                    fi
+                fi
+            done
+            CERTS_HTML="$CERTS_HTML</div></div>"
+        fi
+        
+        # Extract entitlements
+        /usr/libexec/PlistBuddy -c "Print Entitlements" "$PROFILE_PLIST" -x > "$ENTITLEMENTS_PLIST" 2>/dev/null
+        if [ -f "$ENTITLEMENTS_PLIST" ]; then
+            ENTITLEMENTS_TEXT=$(plutil -convert json -o - "$ENTITLEMENTS_PLIST" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for key in sorted(data.keys()):
+        val = data[key]
+        if isinstance(val, bool):
+            val = 'true' if val else 'false'
+        elif isinstance(val, list):
+            val = '(' + ', '.join(str(v) for v in val) + ')'
+        elif isinstance(val, dict):
+            val = '{' + ', '.join(f'{k}: {v}' for k,v in val.items()) + '}'
+        print(f'{key} = {val}')
+except:
+    pass
+" 2>/dev/null)
+            if [ -n "$ENTITLEMENTS_TEXT" ]; then
+                ENTITLEMENTS_HTML="<div class='section'><h2>Entitlements</h2><pre class='entitlements'>$ENTITLEMENTS_TEXT</pre></div>"
+            fi
+        fi
+    fi
+fi
+
+# Generate HTML
+cat > "$OUTPUT_HTML" << 'HTMLEND'
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>IPA Preview</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            padding: 40px;
+            background: #f5f5f7;
+            color: #1d1d1f;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            padding: 32px;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 24px;
+            border-bottom: 2px solid #e5e5e7;
+        }
+        .app-icon {
+            width: 100px;
+            height: 100px;
+            border-radius: 22px;
+            margin-right: 24px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .app-info h1 {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        .app-info .bundle-id {
+            font-size: 14px;
+            color: #86868b;
+            margin-bottom: 12px;
+        }
+        .badges {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            display: inline-block;
+        }
+        .badge.development { background: rgba(0, 122, 255, 0.15); color: #007aff; }
+        .badge.adhoc { background: rgba(175, 82, 222, 0.15); color: #af52de; }
+        .badge.appstore { background: rgba(52, 199, 89, 0.15); color: #34c759; }
+        .badge.enterprise { background: rgba(255, 149, 0, 0.15); color: #ff9500; }
+        .badge.platform { background: rgba(90, 200, 250, 0.15); color: #5ac8fa; }
+        .section {
+            margin-bottom: 32px;
+        }
+        .section h2 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #1d1d1f;
+        }
+        .info-row {
+            display: flex;
+            padding: 12px 0;
+            border-bottom: 1px solid #f5f5f7;
+        }
+        .info-row:last-child {
+            border-bottom: none;
+        }
+        .info-label {
+            width: 200px;
+            font-size: 15px;
+            color: #86868b;
+            flex-shrink: 0;
+        }
+        .info-value {
+            font-size: 15px;
+            color: #1d1d1f;
+            font-weight: 500;
+            word-break: break-word;
+        }
+        .device-list, .certs-list {
+            background: #f5f5f7;
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .device-row {
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 13px;
+            padding: 8px 0;
+            border-bottom: 1px solid #e5e5e7;
+        }
+        .device-row:last-child {
+            border-bottom: none;
+        }
+        .cert-row {
+            display: flex;
+            padding: 8px 0;
+            align-items: flex-start;
+        }
+        .cert-row:last-child {
+            border-bottom: none;
+        }
+        .cert-label {
+            width: 150px;
+            font-size: 14px;
+            color: #86868b;
+            flex-shrink: 0;
+        }
+        .cert-value {
+            font-size: 14px;
+            color: #1d1d1f;
+            font-weight: 500;
+            word-break: break-all;
+        }
+        .cert-hash {
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .cert-detail {
+            background: #f5f5f7;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .cert-detail:last-child {
+            margin-bottom: 0;
+        }
+        .cert-separator {
+            height: 1px;
+            background: #e5e5e7;
+            margin: 16px 0;
+        }
+        .cert-subject {
+            font-size: 14px;
+            font-weight: 500;
+            flex: 1;
+        }
+        .cert-expiry {
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 13px;
+            color: #86868b;
+            white-space: nowrap;
+            margin-left: 16px;
+        }
+        .entitlements {
+            background: #f5f5f7;
+            border-radius: 8px;
+            padding: 16px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+HTMLEND
+
+if [ -n "$ICON_DATA" ]; then
+    echo "            <img src=\"$ICON_DATA\" class=\"app-icon\" />" >> "$OUTPUT_HTML"
+else
+    echo "            <div class=\"app-icon\"></div>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << HTMLEND
+            <div class="app-info">
+                <h1>$APP_NAME</h1>
+                <div class="bundle-id">$BUNDLE_ID</div>
+HTMLEND
+
+if [ -n "$PROFILE_TYPE" ]; then
+    PROFILE_BADGE_CLASS=$(echo "$PROFILE_TYPE" | tr '[:upper:]' '[:lower:]' | tr -d ' ()' )
+    cat >> "$OUTPUT_HTML" << HTMLEND
+                <div class="badges">
+                    <span class="badge platform">$PLATFORM</span>
+                    <span class="badge $PROFILE_BADGE_CLASS">$PROFILE_TYPE</span>
+HTMLEND
+    if [ -n "$DEVICE_COUNT" ]; then
+        cat >> "$OUTPUT_HTML" << HTMLEND
+                    <span class="badge platform">$DEVICE_COUNT devices</span>
+HTMLEND
+    fi
+    if [ "$CERT_COUNT" -gt 0 ]; then
+        cat >> "$OUTPUT_HTML" << HTMLEND
+                    <span class="badge platform">$CERT_COUNT certificates</span>
+HTMLEND
+    fi
+    cat >> "$OUTPUT_HTML" << HTMLEND
+                </div>
+HTMLEND
+fi
+
+cat >> "$OUTPUT_HTML" << HTMLEND
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>Application Information</h2>
+            <div class="info-row">
+                <div class="info-label">Version</div>
+                <div class="info-value">$VERSION ($BUILD)</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Bundle Identifier</div>
+                <div class="info-value">$BUNDLE_ID</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Device Family</div>
+                <div class="info-value">$DEVICE_FAMILY</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Minimum iOS Version</div>
+                <div class="info-value">$MIN_OS</div>
+            </div>
+HTMLEND
+
+if [ -n "$SDK_VERSION" ]; then
+    cat >> "$OUTPUT_HTML" << HTMLEND
+            <div class="info-row">
+                <div class="info-label">SDK Version</div>
+                <div class="info-value">$SDK_VERSION</div>
+            </div>
+HTMLEND
+fi
+
+cat >> "$OUTPUT_HTML" << HTMLEND
+            <div class="info-row">
+                <div class="info-label">File Size</div>
+                <div class="info-value">$FILE_SIZE</div>
+            </div>
+        </div>
+HTMLEND
+
+if [ "$FRAMEWORKS_COUNT" -gt 0 ]; then
+cat >> "$OUTPUT_HTML" << HTMLEND
+        <div class="section">
+            <h2>Embedded Frameworks ($FRAMEWORKS_COUNT)</h2>
+            <div class="device-list">
+HTMLEND
+    while IFS= read -r framework; do
+        if [ -n "$framework" ]; then
+            echo "                <div class='device-row'>$framework</div>" >> "$OUTPUT_HTML"
+        fi
+    done <<< "$FRAMEWORKS_LIST"
+cat >> "$OUTPUT_HTML" << HTMLEND
+            </div>
+        </div>
+HTMLEND
+fi
+
+if [ "$BUNDLES_COUNT" -gt 0 ]; then
+cat >> "$OUTPUT_HTML" << HTMLEND
+        <div class="section">
+            <h2>App Extensions & Bundles ($BUNDLES_COUNT)</h2>
+            <div class="device-list">
+HTMLEND
+    while IFS= read -r bundle; do
+        if [ -n "$bundle" ]; then
+            echo "                <div class='device-row'>$bundle</div>" >> "$OUTPUT_HTML"
+        fi
+    done <<< "$BUNDLES_LIST"
+cat >> "$OUTPUT_HTML" << HTMLEND
+            </div>
+        </div>
+HTMLEND
+fi
+
+if [ -n "$PROFILE_NAME" ]; then
+cat >> "$OUTPUT_HTML" << HTMLEND
+        <div class="section">
+            <h2>Embedded Provisioning Profile</h2>
+            <div class="info-row">
+                <div class="info-label">Profile Name</div>
+                <div class="info-value">$PROFILE_NAME</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">UUID</div>
+                <div class="info-value">$PROFILE_UUID</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Team</div>
+                <div class="info-value">$TEAM_NAME ($TEAM_ID)</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">App ID</div>
+                <div class="info-value">$APP_ID_NAME</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Created</div>
+                <div class="info-value">$CREATION</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Expires</div>
+                <div class="info-value">$EXPIRY</div>
+            </div>
+        </div>
+HTMLEND
+fi
+
+if [ -n "$ENTITLEMENTS_HTML" ]; then
+    echo "$ENTITLEMENTS_HTML" >> "$OUTPUT_HTML"
+fi
+
+if [ -n "$CERTS_HTML" ]; then
+    echo "$CERTS_HTML" >> "$OUTPUT_HTML"
+fi
+
+if [ -n "$DEVICES_HTML" ]; then
+    echo "$DEVICES_HTML" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << 'HTMLEND'
+    </div>
+</body>
+</html>
+HTMLEND
+
+# Open in default browser
+open "$OUTPUT_HTML"
+
+# Keep terminal running until user closes it
+# Temp files will be cleaned up when terminal is closed
+trap "rm -rf $TEMP_DIR" EXIT
+
+# Wait in background - terminal stays open but doesn't block
+tail -f /dev/null
